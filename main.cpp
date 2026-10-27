@@ -1,1442 +1,691 @@
+// =====================================================================
+//  CALCII — DHRUV PRATAP
+//  Win32 GUI calculator:  basic keypad + SCI + INFO + UNIT converter
+//
+//  Build (MinGW-w64):  g++ main.cpp -o calcii.exe -mwindows -static -lgdi32 -luser32
+//  Build (MSVC):       cl /EHsc /utf-8 main.cpp user32.lib gdi32.lib /link /SUBSYSTEM:WINDOWS /OUT:calcii.exe
+//
+//  SCI  : scientific functions only (no entropy)
+//  INFO : entropy + information content (bits / nats / hartleys)
+//  UNIT : opens a separate converter window (length, mass, temperature,
+//         time, speed, area, volume, data)
+//  GUI  : light grey background, blue controls, white display
+// =====================================================================
+#ifndef UNICODE
+#define UNICODE
+#endif
+#ifndef _UNICODE
+#define _UNICODE
+#endif
 #include <windows.h>
+#include <cwctype>
+#include <cwchar>
 #include <cmath>
 #include <string>
-#include <sstream>
-#include <iomanip>
+#include <vector>
+#include <algorithm>
 
-#define MAIN_DISPLAY 100
-#define SCI_DISPLAY  200
+static const double PI = 3.14159265358979323846;
 
-// Main calculator buttons
-#define M0 1
-#define M1 2
-#define M2 3
-#define M3 4
-#define M4 5
-#define M5 6
-#define M6 7
-#define M7 8
-#define M8 9
-#define M9 10
+// ---------------------------------------------------------------- globals
+static HINSTANCE hInst;
+static HWND hMain, hTitle, hIn, hOut, hModeLbl;
+static HWND hExtra[16];
+static HFONT g_btnFont, g_dispFont, g_titleFont, g_smallFont;
+static HFONT g_scaledBtnFont, g_scaledDispFont, g_scaledTitleFont, g_scaledSmallFont;
+static HBRUSH hSurface, hWhite;
+static bool   g_deg = true;
+static double g_ans = 0;
+static int    g_mode = 0;          // 0 = SCI, 1 = INFO
+static WNDPROC oldEditProc;
 
-#define M_ADD      11
-#define M_SUB      12
-#define M_MUL      13
-#define M_DIV      14
-#define M_EQUAL    15
-#define M_CLEAR    16
-#define M_DOT      17
-#define M_PERCENT  18
-#define M_SCI      19
+struct MainChildLayout { HWND window; RECT bounds; HFONT font; };
+static std::vector<MainChildLayout> g_mainChildren;
 
-// Scientific numeric buttons
-#define S0 30
-#define S1 31
-#define S2 32
-#define S3 33
-#define S4 34
-#define S5 35
-#define S6 36
-#define S7 37
-#define S8 38
-#define S9 39
+enum { ID_SCI = 900, ID_INFO = 901, ID_UNIT = 902,
+       ID_EXTRA = 1000, ID_KEY = 2000, ID_EQ = 2100 };
 
-#define S_ADD      40
-#define S_SUB      41
-#define S_MUL      42
-#define S_DIV      43
-#define S_EQUAL    44
-#define S_CLEAR    45
-#define S_DOT      46
+// ---------------------------------------------------------------- helpers
+struct Err { std::wstring m; };
 
-// Scientific functions
-#define S_SIN      50
-#define S_COS      51
-#define S_TAN      52
-#define S_CSC      53
-#define S_SEC      54
-#define S_COT      55
-
-#define S_LOG      56
-#define S_LN       57
-#define S_LOG2     58
-
-#define S_SQRT     59
-#define S_SQUARE   60
-#define S_POWER    61
-#define S_FACTORIAL 62
-
-#define S_ENTROPY  63
-#define S_PI       64
-#define S_E        65
-
-#define S_BACK     66
-
-
-// ---------------------------------------------------------
-// GLOBAL VARIABLES
-// ---------------------------------------------------------
-
-HWND mainDisplay;
-HWND sciDisplay;
-
-HWND mainWindow;
-HWND scientificWindow;
-
-double mainFirstNumber = 0;
-char mainOperation = 0;
-bool mainNewNumber = true;
-
-double sciFirstNumber = 0;
-char sciOperation = 0;
-bool sciNewNumber = true;
-
-bool powerMode = false;
-
-HFONT normalFont;
-HFONT displayFont;
-
-
-// ---------------------------------------------------------
-// NUMBER FORMAT
-// ---------------------------------------------------------
-
-std::string formatNumber(double value)
-{
-    std::ostringstream ss;
-
-    ss << std::setprecision(12) << value;
-
-    std::string result = ss.str();
-
-    if (result.find('.') != std::string::npos)
-    {
-        while (!result.empty() && result.back() == '0')
-            result.pop_back();
-
-        if (!result.empty() && result.back() == '.')
-            result.pop_back();
-    }
-
-    if (result == "-0")
-        result = "0";
-
-    return result;
+static std::wstring F(double v) {
+    if (v == 0) v = 0.0;
+    wchar_t b[64];
+    if (std::isfinite(v) && std::fabs(v) < 1e15 && v == std::floor(v))
+        _snwprintf(b, 64, L"%.0f", v);
+    else
+        _snwprintf(b, 64, L"%.10g", v);
+    b[63] = 0;
+    return b;
 }
 
+static std::wstring getText(HWND h) {
+    int n = GetWindowTextLengthW(h);
+    std::wstring s(n + 1, L'\0');
+    GetWindowTextW(h, &s[0], n + 1);
+    s.resize(n);
+    return s;
+}
 
-// ---------------------------------------------------------
-// MAIN DISPLAY
-// ---------------------------------------------------------
+static BOOL CALLBACK collectMainChild(HWND child, LPARAM) {
+    RECT bounds;
+    if (!GetWindowRect(child, &bounds)) return TRUE;
+    MapWindowPoints(HWND_DESKTOP, hMain, (POINT*)&bounds, 2);
+    g_mainChildren.push_back({ child, bounds, (HFONT)SendMessageW(child, WM_GETFONT, 0, 0) });
+    return TRUE;
+}
 
-double getMainNumber()
-{
-    char text[200];
+static HFONT makeScaledFont(int height, int weight, const wchar_t* face, double scale) {
+    return CreateFontW((int)-std::lround(height * scale), 0, 0, 0, weight,
+                       0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, face);
+}
 
-    GetWindowTextA(
-        mainDisplay,
-        text,
-        sizeof(text)
-    );
+static void layoutMain(int width, int height) {
+    if (width <= 0 || height <= 0 || g_mainChildren.empty()) return;
+    const double sx = width / 760.0;
+    const double sy = height / 470.0;
+    const double fontScale = std::min(sx, sy);
 
-    try
-    {
-        return std::stod(text);
+    HFONT newBtn = makeScaledFont(17, FW_BOLD, L"Segoe UI", fontScale);
+    HFONT newDisp = makeScaledFont(26, FW_NORMAL, L"Consolas", fontScale);
+    HFONT newTitle = makeScaledFont(20, FW_BOLD, L"Segoe UI", fontScale);
+    HFONT newSmall = makeScaledFont(15, FW_NORMAL, L"Segoe UI", fontScale);
+
+    for (const MainChildLayout& child : g_mainChildren) {
+        const RECT& r = child.bounds;
+        MoveWindow(child.window,
+                   (int)std::lround(r.left * sx), (int)std::lround(r.top * sy),
+                   (int)std::lround((r.right - r.left) * sx),
+                   (int)std::lround((r.bottom - r.top) * sy), TRUE);
+        HFONT font = child.font == g_btnFont ? newBtn
+                   : child.font == g_dispFont ? newDisp
+                   : child.font == g_titleFont ? newTitle
+                   : child.font == g_smallFont ? newSmall : NULL;
+        if (font) SendMessageW(child.window, WM_SETFONT, (WPARAM)font, TRUE);
     }
-    catch (...)
-    {
+
+    HFONT oldBtn = g_scaledBtnFont, oldDisp = g_scaledDispFont;
+    HFONT oldTitle = g_scaledTitleFont, oldSmall = g_scaledSmallFont;
+    g_scaledBtnFont = newBtn;
+    g_scaledDispFont = newDisp;
+    g_scaledTitleFont = newTitle;
+    g_scaledSmallFont = newSmall;
+    if (oldBtn) DeleteObject(oldBtn);
+    if (oldDisp) DeleteObject(oldDisp);
+    if (oldTitle) DeleteObject(oldTitle);
+    if (oldSmall) DeleteObject(oldSmall);
+}
+
+// ------------------------------------------------------- expression parser
+struct Parser {
+    std::wstring s; size_t p = 0;
+    explicit Parser(std::wstring t) : s(std::move(t)) {}
+
+    void ws() { while (p < s.size() && iswspace(s[p])) p++; }
+    bool eat(wchar_t c) { ws(); if (p < s.size() && s[p] == c) { p++; return true; } return false; }
+
+    double parse() {
+        double v = expr(); ws();
+        if (p < s.size()) throw Err{ std::wstring(L"Unexpected '") + s[p] + L"'" };
+        if (!std::isfinite(v)) throw Err{ L"Math error" };
+        return v;
+    }
+    double expr() {
+        double v = term();
+        for (;;) {
+            if (eat(L'+')) v += term();
+            else if (eat(L'-')) v -= term();
+            else return v;
+        }
+    }
+    double term() {
+        double v = unary();
+        for (;;) {
+            if (eat(L'*')) v *= unary();
+            else if (eat(L'/')) {
+                double d = unary();
+                if (d == 0) throw Err{ L"Divide by zero" };
+                v /= d;
+            } else return v;
+        }
+    }
+    double unary() {
+        if (eat(L'-')) return -unary();
+        if (eat(L'+')) return unary();
+        return power();
+    }
+    double power() {
+        double b = postfix();
+        if (eat(L'^')) return std::pow(b, unary());
+        return b;
+    }
+    double postfix() {
+        double v = primary();
+        while (eat(L'!')) v = fact(v);
+        return v;
+    }
+    static double fact(double a) {
+        if (a < 0 || a != std::floor(a) || a > 170) throw Err{ L"n! needs integer 0..170" };
+        double r = 1; for (int i = 2; i <= (int)a; i++) r *= i;
+        return r;
+    }
+    double primary() {
+        ws();
+        if (p >= s.size()) throw Err{ L"Unexpected end" };
+        wchar_t c = s[p];
+        if (c == L'(') {
+            p++; double v = expr();
+            if (!eat(L')')) throw Err{ L"Missing )" };
+            return v;
+        }
+        if (iswdigit(c) || c == L'.') {
+            const wchar_t* b = s.c_str() + p; wchar_t* e;
+            double v = wcstod(b, &e);
+            if (e == b) throw Err{ L"Bad number" };
+            p += (size_t)(e - b);
+            return v;
+        }
+        if (iswalpha(c)) {
+            size_t st = p;
+            while (p < s.size() && iswalnum(s[p])) p++;
+            std::wstring n = s.substr(st, p - st);
+            for (auto& ch : n) ch = (wchar_t)towlower(ch);
+            if (n == L"pi") return PI;
+            if (n == L"e") return std::exp(1.0);
+            if (n == L"ans") return g_ans;
+            if (!eat(L'(')) throw Err{ L"Unknown name: " + n };
+            double a = expr();
+            if (!eat(L')')) throw Err{ L"Missing )" };
+            return func(n, a);
+        }
+        throw Err{ std::wstring(L"Unexpected '") + c + L"'" };
+    }
+    static double func(const std::wstring& n, double a) {
+        double k = g_deg ? PI / 180.0 : 1.0;
+        if (n == L"sin") return std::sin(a * k);
+        if (n == L"cos") return std::cos(a * k);
+        if (n == L"tan") return std::tan(a * k);
+        if (n == L"asin") return std::asin(a) / k;
+        if (n == L"acos") return std::acos(a) / k;
+        if (n == L"atan") return std::atan(a) / k;
+        if (n == L"sinh") return std::sinh(a);
+        if (n == L"cosh") return std::cosh(a);
+        if (n == L"tanh") return std::tanh(a);
+        if (n == L"ln") { if (a <= 0) throw Err{ L"ln needs x > 0" }; return std::log(a); }
+        if (n == L"log" || n == L"log10") { if (a <= 0) throw Err{ L"log needs x > 0" }; return std::log10(a); }
+        if (n == L"log2") { if (a <= 0) throw Err{ L"log2 needs x > 0" }; return std::log2(a); }
+        if (n == L"sqrt") { if (a < 0) throw Err{ L"sqrt of negative" }; return std::sqrt(a); }
+        if (n == L"cbrt") return std::cbrt(a);
+        if (n == L"exp") return std::exp(a);
+        if (n == L"abs") return std::fabs(a);
+        if (n == L"floor") return std::floor(a);
+        if (n == L"ceil") return std::ceil(a);
+        if (n == L"fact") return fact(a);
+        throw Err{ L"Unknown function: " + n };
+    }
+};
+
+// ---------------------------------------------------------------- INFO mode
+static std::vector<double> parseList(const std::wstring& t) {
+    std::vector<double> r; int d = 0; std::wstring cur;
+    auto flush = [&]() {
+        if (cur.find_first_not_of(L" \t") != std::wstring::npos) {
+            Parser P(cur); r.push_back(P.parse());
+        }
+        cur.clear();
+    };
+    for (wchar_t c : t) {
+        if (c == L'(') d++;
+        if (c == L')') d--;
+        if (c == L',' && d == 0) flush(); else cur += c;
+    }
+    flush();
+    return r;
+}
+
+// Shannon entropy in nats. Values summing to 1 are probabilities,
+// anything else is treated as counts and normalised.
+static double entropyNats(const std::vector<double>& v, bool& normalised) {
+    if (v.empty()) throw Err{ L"Enter values like 0.5, 0.25, 0.25" };
+    double sum = 0;
+    for (double x : v) { if (x < 0) throw Err{ L"Values cannot be negative" }; sum += x; }
+    if (sum <= 0) throw Err{ L"Sum must be > 0" };
+    normalised = std::fabs(sum - 1.0) > 1e-9;
+    double H = 0;
+    for (double x : v) { double p = x / sum; if (p > 0) H -= p * std::log(p); }
+    return H;
+}
+
+static void baseInfo(const std::wstring& s, double& lnb, const wchar_t*& name) {
+    if (s == L"2")  { lnb = std::log(2.0);  name = L"bits"; }
+    else if (s == L"e") { lnb = 1.0;        name = L"nats"; }
+    else            { lnb = std::log(10.0); name = L"hartleys"; }
+}
+
+static void setOut(const std::wstring& s) { SetWindowTextW(hOut, s.c_str()); }
+
+static void doInfo(const std::wstring& code) {
+    std::wstring t = getText(hIn);
+    try {
+        const double LN2 = std::log(2.0);
+        if (code[0] == L'H') {                       // H2 / He / H10
+            double lnb; const wchar_t* nm; baseInfo(code.substr(1), lnb, nm);
+            bool norm; double H = entropyNats(parseList(t), norm);
+            setOut(L"H = " + F(H / lnb) + L" " + nm + (norm ? L"  (counts normalised)" : L""));
+            return;
+        }
+        if (code[0] == L'I') {                       // I2 / Ie / I10
+            double lnb; const wchar_t* nm; baseInfo(code.substr(1), lnb, nm);
+            auto v = parseList(t);
+            if (v.size() != 1) throw Err{ L"Enter one probability p" };
+            if (v[0] <= 0 || v[0] > 1) throw Err{ L"p must be in (0, 1]" };
+            setOut(L"I(p) = " + F(-std::log(v[0]) / lnb) + L" " + nm);
+            return;
+        }
+        // Efficiency and redundancy
+        bool norm; auto v = parseList(t);
+        double Hb = entropyNats(v, norm) / LN2;
+        if (v.size() < 2) throw Err{ L"Need at least 2 outcomes" };
+        double eff = Hb / std::log2((double)v.size());
+        if (code == L"eff") setOut(L"Efficiency = " + F(eff) + L"  (" + F(eff * 100) + L"%)");
+        else                setOut(L"Redundancy = " + F(1 - eff) + L"  (" + F((1 - eff) * 100) + L"%)");
+    } catch (Err& e) { setOut(L"Error: " + e.m); }
+    catch (...) { setOut(L"Error"); }
+}
+
+// ------------------------------------------------------------ button tables
+struct Ex { const wchar_t* label; const wchar_t* ins; };
+
+static const Ex SCI[16] = {
+    {L"sin", L"sin("}, {L"cos", L"cos("}, {L"tan", L"tan("}, {L"DEG", L"#deg"},
+    {L"asin", L"asin("}, {L"acos", L"acos("}, {L"atan", L"atan("}, {L"ln", L"ln("},
+    {L"log10", L"log("}, {L"\u221A", L"sqrt("}, {L"x\u00B2", L"^2"}, {L"e\u02E3", L"exp("},
+    {L"n!", L"!"}, {L"1/x", L"1/("}, {L"\u03C0", L"pi"}, {L"e", L"e"}
+};
+
+static const Ex INFO[] = {
+    {L"H bits", L"#H2"}, {L"H nats", L"#He"}, {L"H hart", L"#H10"},
+    {L"I bits", L"#I2"}, {L"I nats", L"#Ie"}, {L"I hart", L"#I10"},
+    {L"Effic.", L"#eff"}, {L"Redund.", L"#red"}, {L"log2", L"log2("},
+    {L"ln", L"ln("}, {L"log10", L"log10("}, {L"n!", L"!"}, {L",", L","}
+};
+static const int INFO_COUNT = (int)(sizeof(INFO) / sizeof(INFO[0]));
+static const Ex KEYS[20] = {
+    {L"C", L"#C"}, {L"(", L"("}, {L")", L")"}, {L"DEL", L"#DEL"},
+    {L"7", L"7"}, {L"8", L"8"}, {L"9", L"9"}, {L"\u00F7", L"/"},
+    {L"4", L"4"}, {L"5", L"5"}, {L"6", L"6"}, {L"\u00D7", L"*"},
+    {L"1", L"1"}, {L"2", L"2"}, {L"3", L"3"}, {L"-", L"-"},
+    {L"0", L"0"}, {L".", L"."}, {L"^", L"^"}, {L"+", L"+"}
+};
+
+static void updateStatus() {
+    std::wstring s = (g_mode == 0)
+        ? std::wstring(L"SCI  |  angle: ") + (g_deg ? L"DEG" : L"RAD")
+        : L"INFO  |  type probabilities or counts:  0.5, 0.25, 0.25";
+    SetWindowTextW(hModeLbl, s.c_str());
+}
+
+static void setMode(int m) {
+    g_mode = m;
+    const Ex* t = (m == 0) ? SCI : INFO;
+    for (int i = 0; i < 16; i++) {
+        const bool visible = m == 0 || i < INFO_COUNT;
+        ShowWindow(hExtra[i], visible ? SW_SHOW : SW_HIDE);
+        if (visible) {
+            std::wstring lab = t[i].label;
+            if (m == 0 && std::wstring(t[i].ins) == L"#deg") lab = g_deg ? L"DEG" : L"RAD";
+            SetWindowTextW(hExtra[i], lab.c_str());
+            InvalidateRect(hExtra[i], NULL, TRUE);
+        }
+    }
+    InvalidateRect(GetDlgItem(hMain, ID_SCI), NULL, TRUE);
+    InvalidateRect(GetDlgItem(hMain, ID_INFO), NULL, TRUE);
+    updateStatus();
+}
+
+static void doEquals() {
+    std::wstring t = getText(hIn);
+    if (t.empty()) return;
+    try {
+        Parser P(t); double v = P.parse();
+        g_ans = v; setOut(F(v));
+    } catch (Err& e) { setOut(L"Error: " + e.m); }
+    catch (...) { setOut(L"Error"); }
+}
+
+static void doExtra(int i) {
+    if (i < 0 || i >= (g_mode == 0 ? 16 : INFO_COUNT)) return;
+    const Ex& e = ((g_mode == 0) ? SCI : INFO)[i];
+    std::wstring ins = e.ins;
+    if (ins.empty()) return;
+    if (ins == L"#deg") { g_deg = !g_deg; setMode(g_mode); return; }
+    if (ins[0] == L'#') { doInfo(ins.substr(1)); return; }
+    SendMessageW(hIn, EM_REPLACESEL, TRUE, (LPARAM)ins.c_str());
+}
+
+static void doKey(int i) {
+    std::wstring ins = KEYS[i].ins;
+    if (ins == L"#C")   { SetWindowTextW(hIn, L""); SetWindowTextW(hOut, L""); return; }
+    if (ins == L"#DEL") { SendMessageW(hIn, WM_CHAR, VK_BACK, 0); return; }
+    SendMessageW(hIn, EM_REPLACESEL, TRUE, (LPARAM)ins.c_str());
+}
+
+enum { U_CAT = 3001, U_FROM, U_TO, U_VAL, U_RES, U_CONV = 3100, U_SWAP };
+
+// -------------------------------------------------------- owner-drawn buttons
+static void DrawBtn(DRAWITEMSTRUCT* d, bool active) {
+    HDC dc = d->hDC; RECT r = d->rcItem;
+    bool sel = (d->itemState & ODS_SELECTED) != 0;
+    bool primary = d->CtlID == ID_EQ || d->CtlID == U_CONV;
+    COLORREF buttonColor = sel ? RGB(187, 207, 235)
+        : (active || primary) ? RGB(48, 105, 184) : RGB(224, 233, 245);
+    HBRUSH b = CreateSolidBrush(buttonColor);
+    FillRect(dc, &r, b); DeleteObject(b);
+    HBRUSH fb = CreateSolidBrush(active || primary ? RGB(255, 255, 255) : RGB(168, 188, 215));
+    FrameRect(dc, &r, fb);
+    if (active) { InflateRect(&r, -1, -1); FrameRect(dc, &r, fb); InflateRect(&r, 1, 1); }
+    DeleteObject(fb);
+    wchar_t t[64]; GetWindowTextW(d->hwndItem, t, 64);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, active || primary ? RGB(255, 255, 255) : RGB(35, 57, 84));
+    HFONT old = (HFONT)SelectObject(dc, g_btnFont);
+    DrawTextW(dc, t, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(dc, old);
+}
+
+static HWND MkBtn(HWND parent, const wchar_t* t, int id, int x, int y, int w, int h) {
+    HWND b = CreateWindowW(L"BUTTON", t, WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                           x, y, w, h, parent, (HMENU)(INT_PTR)id, hInst, 0);
+    SendMessageW(b, WM_SETFONT, (WPARAM)g_btnFont, TRUE);
+    return b;
+}
+
+static LRESULT CALLBACK EditProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_CHAR && w == VK_RETURN) { PostMessageW(GetParent(h), WM_COMMAND, ID_EQ, 0); return 0; }
+    if (m == WM_CHAR && w == VK_ESCAPE) { PostMessageW(GetParent(h), WM_COMMAND, ID_KEY, 0); return 0; }
+    return CallWindowProcW(oldEditProc, h, m, w, l);
+}
+
+// ====================================================================
+//                         UNIT CONVERTER WINDOW
+// ====================================================================
+struct U { const wchar_t* n; double f; };
+
+static const U LEN[] = {
+    {L"millimetre (mm)", 0.001}, {L"centimetre (cm)", 0.01}, {L"metre (m)", 1}, {L"kilometre (km)", 1000},
+    {L"inch (in)", 0.0254}, {L"foot (ft)", 0.3048}, {L"yard (yd)", 0.9144},
+    {L"mile (mi)", 1609.344}, {L"nautical mile", 1852} };
+static const U MASS[] = {
+    {L"milligram (mg)", 1e-6}, {L"gram (g)", 0.001}, {L"kilogram (kg)", 1}, {L"tonne (t)", 1000},
+    {L"ounce (oz)", 0.028349523125}, {L"pound (lb)", 0.45359237}, {L"stone (st)", 6.35029318} };
+static const U TEMP[] = { {L"Celsius (\u00B0C)", 0}, {L"Fahrenheit (\u00B0F)", 0}, {L"Kelvin (K)", 0} };
+static const U TIME[] = {
+    {L"millisecond (ms)", 0.001}, {L"second (s)", 1}, {L"minute (min)", 60}, {L"hour (h)", 3600},
+    {L"day", 86400}, {L"week", 604800}, {L"year (365.25 d)", 31557600} };
+static const U SPEED[] = {
+    {L"metre/second (m/s)", 1}, {L"kilometre/hour (km/h)", 1.0 / 3.6}, {L"mile/hour (mph)", 0.44704},
+    {L"knot (kn)", 1852.0 / 3600.0}, {L"foot/second (ft/s)", 0.3048}, {L"Mach (sea level)", 340.29} };
+static const U AREA[] = {
+    {L"mm\u00B2", 1e-6}, {L"cm\u00B2", 1e-4}, {L"m\u00B2", 1}, {L"hectare (ha)", 1e4}, {L"km\u00B2", 1e6},
+    {L"in\u00B2", 6.4516e-4}, {L"ft\u00B2", 0.09290304}, {L"yd\u00B2", 0.83612736},
+    {L"acre", 4046.8564224}, {L"mi\u00B2", 2589988.110336} };
+static const U VOL[] = {   // base = litre
+    {L"millilitre (mL)", 0.001}, {L"litre (L)", 1}, {L"cubic metre (m\u00B3)", 1000},
+    {L"teaspoon (US)", 0.00492892159375}, {L"tablespoon (US)", 0.01478676478125},
+    {L"fluid ounce (US)", 0.0295735295625}, {L"cup (US)", 0.2365882365},
+    {L"pint (US)", 0.473176473}, {L"quart (US)", 0.946352946}, {L"gallon (US)", 3.785411784} };
+static const U DATA[] = {  // base = byte
+    {L"bit", 0.125}, {L"byte (B)", 1}, {L"kilobyte (KB, 1000)", 1e3}, {L"megabyte (MB)", 1e6},
+    {L"gigabyte (GB)", 1e9}, {L"terabyte (TB)", 1e12}, {L"kibibyte (KiB, 1024)", 1024.0},
+    {L"mebibyte (MiB)", 1048576.0}, {L"gibibyte (GiB)", 1073741824.0},
+    {L"tebibyte (TiB)", 1099511627776.0} };
+
+struct Cat { const wchar_t* name; const U* u; int n; bool temp; };
+#define CNT(a) ((int)(sizeof(a) / sizeof(U)))
+static const Cat CATS[] = {
+    {L"Length", LEN, CNT(LEN), false}, {L"Mass", MASS, CNT(MASS), false},
+    {L"Temperature", TEMP, CNT(TEMP), true}, {L"Time", TIME, CNT(TIME), false},
+    {L"Speed", SPEED, CNT(SPEED), false}, {L"Area", AREA, CNT(AREA), false},
+    {L"Volume", VOL, CNT(VOL), false}, {L"Data", DATA, CNT(DATA), false} };
+static const int NCATS = (int)(sizeof(CATS) / sizeof(Cat));
+
+static HWND hUnit, uTitle, uCat, uFrom, uTo, uVal, uRes;
+
+static void uFill() {
+    int c = (int)SendMessageW(uCat, CB_GETCURSEL, 0, 0); if (c < 0) c = 0;
+    SendMessageW(uFrom, CB_RESETCONTENT, 0, 0);
+    SendMessageW(uTo, CB_RESETCONTENT, 0, 0);
+    for (int i = 0; i < CATS[c].n; i++) {
+        SendMessageW(uFrom, CB_ADDSTRING, 0, (LPARAM)CATS[c].u[i].n);
+        SendMessageW(uTo, CB_ADDSTRING, 0, (LPARAM)CATS[c].u[i].n);
+    }
+    SendMessageW(uFrom, CB_SETCURSEL, 0, 0);
+    SendMessageW(uTo, CB_SETCURSEL, CATS[c].n > 1 ? 1 : 0, 0);
+}
+
+static void uConvert() {
+    if (!uRes || !uVal || !uCat || !uFrom || !uTo) return;
+    int c = (int)SendMessageW(uCat, CB_GETCURSEL, 0, 0);
+    int a = (int)SendMessageW(uFrom, CB_GETCURSEL, 0, 0);
+    int b = (int)SendMessageW(uTo, CB_GETCURSEL, 0, 0);
+    if (c < 0 || a < 0 || b < 0) return;
+    std::wstring t = getText(uVal);
+    if (t.empty()) { SetWindowTextW(uRes, L""); return; }
+    try {
+        Parser P(t); double x = P.parse(), r;
+        const Cat& ct = CATS[c];
+        if (ct.temp) {
+            double C = (a == 0) ? x : (a == 1) ? (x - 32.0) * 5.0 / 9.0 : x - 273.15;
+            if (C < -273.15 - 1e-9) throw Err{ L"Below absolute zero" };
+            r = (b == 0) ? C : (b == 1) ? C * 9.0 / 5.0 + 32.0 : C + 273.15;
+        } else {
+            r = x * ct.u[a].f / ct.u[b].f;
+        }
+        SetWindowTextW(uRes, F(r).c_str());
+    } catch (Err& e) { SetWindowTextW(uRes, (L"Error: " + e.m).c_str()); }
+    catch (...) { SetWindowTextW(uRes, L"Error"); }
+}
+
+static HWND MkLabel(HWND p, const wchar_t* t, int x, int y, int w, int h) {
+    HWND s = CreateWindowW(L"STATIC", t, WS_CHILD | WS_VISIBLE, x, y, w, h, p, 0, hInst, 0);
+    SendMessageW(s, WM_SETFONT, (WPARAM)g_smallFont, TRUE);
+    return s;
+}
+static HWND MkCombo(HWND p, int id, int x, int y, int w) {
+    HWND c = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+                           x, y, w, 220, p, (HMENU)(INT_PTR)id, hInst, 0);
+    SendMessageW(c, WM_SETFONT, (WPARAM)g_smallFont, TRUE);
+    return c;
+}
+
+static LRESULT CALLBACK UnitProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_CREATE: {
+        uTitle = CreateWindowW(L"STATIC", L"UNIT CONVERTER", WS_CHILD | WS_VISIBLE | SS_CENTER,
+                               10, 10, 360, 26, h, 0, hInst, 0);
+        SendMessageW(uTitle, WM_SETFONT, (WPARAM)g_titleFont, TRUE);
+        MkLabel(h, L"Category", 15, 50, 90, 22);  uCat  = MkCombo(h, U_CAT, 110, 46, 255);
+        MkLabel(h, L"From", 15, 88, 90, 22);      uFrom = MkCombo(h, U_FROM, 110, 84, 255);
+        MkLabel(h, L"To", 15, 126, 90, 22);       uTo   = MkCombo(h, U_TO, 110, 122, 255);
+        MkLabel(h, L"Value", 15, 172, 90, 22);
+        uVal = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+                               110, 166, 255, 34, h, (HMENU)(INT_PTR)U_VAL, hInst, 0);
+        SendMessageW(uVal, WM_SETFONT, (WPARAM)g_dispFont, TRUE);
+        MkLabel(h, L"Result", 15, 216, 90, 22);
+        uRes = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_READONLY,
+                               110, 210, 255, 34, h, (HMENU)(INT_PTR)U_RES, hInst, 0);
+        SendMessageW(uRes, WM_SETFONT, (WPARAM)g_dispFont, TRUE);
+        MkBtn(h, L"CONVERT", U_CONV, 15, 262, 170, 38);
+        MkBtn(h, L"SWAP", U_SWAP, 195, 262, 170, 38);
+        for (int i = 0; i < NCATS; i++) SendMessageW(uCat, CB_ADDSTRING, 0, (LPARAM)CATS[i].name);
+        SendMessageW(uCat, CB_SETCURSEL, 0, 0);
+        uFill();
+        SetWindowTextW(uVal, L"1");
+        uConvert();
         return 0;
     }
-}
-
-void setMainNumber(double number)
-{
-    std::string text = formatNumber(number);
-
-    SetWindowTextA(
-        mainDisplay,
-        text.c_str()
-    );
-}
-
-
-// ---------------------------------------------------------
-// SCIENTIFIC DISPLAY
-// ---------------------------------------------------------
-
-double getSciNumber()
-{
-    char text[200];
-
-    GetWindowTextA(
-        sciDisplay,
-        text,
-        sizeof(text)
-    );
-
-    try
-    {
-        return std::stod(text);
-    }
-    catch (...)
-    {
+    case WM_COMMAND: {
+        int id = LOWORD(w), code = HIWORD(w);
+        if (!uRes) break;
+        if (id == U_CAT && code == CBN_SELCHANGE) { uFill(); uConvert(); }
+        else if ((id == U_FROM || id == U_TO) && code == CBN_SELCHANGE) uConvert();
+        else if (id == U_VAL && code == EN_CHANGE) uConvert();
+        else if (id == U_CONV) uConvert();
+        else if (id == U_SWAP) {
+            int a = (int)SendMessageW(uFrom, CB_GETCURSEL, 0, 0);
+            int b = (int)SendMessageW(uTo, CB_GETCURSEL, 0, 0);
+            SendMessageW(uFrom, CB_SETCURSEL, b, 0);
+            SendMessageW(uTo, CB_SETCURSEL, a, 0);
+            uConvert();
+        }
         return 0;
     }
-}
-
-void setSciNumber(double number)
-{
-    std::string text = formatNumber(number);
-
-    SetWindowTextA(
-        sciDisplay,
-        text.c_str()
-    );
-}
-
-
-// ---------------------------------------------------------
-// MAIN CALCULATOR
-// ---------------------------------------------------------
-
-void mainAddDigit(char digit)
-{
-    if (mainNewNumber)
-    {
-        std::string text(1, digit);
-
-        SetWindowTextA(
-            mainDisplay,
-            text.c_str()
-        );
-
-        mainNewNumber = false;
-        return;
+    case WM_DRAWITEM: DrawBtn((DRAWITEMSTRUCT*)l, false); return TRUE;
+    case WM_CTLCOLOREDIT: {
+        HDC dc = (HDC)w; SetTextColor(dc, RGB(0, 0, 0)); SetBkColor(dc, RGB(255, 255, 255));
+        return (LRESULT)hWhite;
     }
-
-    char buffer[200];
-
-    GetWindowTextA(
-        mainDisplay,
-        buffer,
-        sizeof(buffer)
-    );
-
-    std::string text(buffer);
-
-    if (text == "0")
-        text = digit;
-    else
-        text += digit;
-
-    SetWindowTextA(
-        mainDisplay,
-        text.c_str()
-    );
-}
-
-void mainDecimal()
-{
-    if (mainNewNumber)
-    {
-        SetWindowTextA(
-            mainDisplay,
-            "0."
-        );
-
-        mainNewNumber = false;
-        return;
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = (HDC)w; HWND c = (HWND)l;
+        if (c == uRes) { SetTextColor(dc, RGB(0, 0, 0)); SetBkColor(dc, RGB(255, 255, 255)); return (LRESULT)hWhite; }
+        SetBkColor(dc, RGB(243, 246, 250));
+        SetTextColor(dc, c == uTitle ? RGB(39, 83, 143) : RGB(63, 79, 99));
+        return (LRESULT)hSurface;
     }
-
-    char buffer[200];
-
-    GetWindowTextA(
-        mainDisplay,
-        buffer,
-        sizeof(buffer)
-    );
-
-    std::string text(buffer);
-
-    if (text.find('.') == std::string::npos)
-    {
-        text += ".";
-
-        SetWindowTextA(
-            mainDisplay,
-            text.c_str()
-        );
-    }
-}
-
-void mainChooseOperation(char op)
-{
-    mainFirstNumber = getMainNumber();
-
-    mainOperation = op;
-
-    mainNewNumber = true;
-}
-
-void mainCalculate()
-{
-    double secondNumber = getMainNumber();
-
-    double result = 0;
-
-    switch (mainOperation)
-    {
-        case '+':
-            result = mainFirstNumber + secondNumber;
-            break;
-
-        case '-':
-            result = mainFirstNumber - secondNumber;
-            break;
-
-        case '*':
-            result = mainFirstNumber * secondNumber;
-            break;
-
-        case '/':
-            if (secondNumber == 0)
-            {
-                SetWindowTextA(
-                    mainDisplay,
-                    "Error"
-                );
-
-                mainNewNumber = true;
-                return;
-            }
-
-            result = mainFirstNumber / secondNumber;
-            break;
-
-        default:
-            return;
-    }
-
-    setMainNumber(result);
-
-    mainOperation = 0;
-    mainNewNumber = true;
-}
-
-void mainClear()
-{
-    SetWindowTextA(
-        mainDisplay,
-        "0"
-    );
-
-    mainFirstNumber = 0;
-    mainOperation = 0;
-    mainNewNumber = true;
-}
-
-void mainPercent()
-{
-    double number = getMainNumber();
-
-    setMainNumber(
-        number / 100.0
-    );
-
-    mainNewNumber = true;
-}
-
-
-// ---------------------------------------------------------
-// SCIENTIFIC NUMBERS
-// ---------------------------------------------------------
-
-void sciAddDigit(char digit)
-{
-    if (sciNewNumber)
-    {
-        std::string text(1, digit);
-
-        SetWindowTextA(
-            sciDisplay,
-            text.c_str()
-        );
-
-        sciNewNumber = false;
-        return;
-    }
-
-    char buffer[200];
-
-    GetWindowTextA(
-        sciDisplay,
-        buffer,
-        sizeof(buffer)
-    );
-
-    std::string text(buffer);
-
-    if (text == "0")
-        text = digit;
-    else
-        text += digit;
-
-    SetWindowTextA(
-        sciDisplay,
-        text.c_str()
-    );
-}
-
-void sciDecimal()
-{
-    if (sciNewNumber)
-    {
-        SetWindowTextA(
-            sciDisplay,
-            "0."
-        );
-
-        sciNewNumber = false;
-        return;
-    }
-
-    char buffer[200];
-
-    GetWindowTextA(
-        sciDisplay,
-        buffer,
-        sizeof(buffer)
-    );
-
-    std::string text(buffer);
-
-    if (text.find('.') == std::string::npos)
-    {
-        text += ".";
-
-        SetWindowTextA(
-            sciDisplay,
-            text.c_str()
-        );
-    }
-}
-
-
-// ---------------------------------------------------------
-// SCIENTIFIC BASIC OPERATIONS
-// ---------------------------------------------------------
-
-void sciChooseOperation(char op)
-{
-    sciFirstNumber = getSciNumber();
-
-    sciOperation = op;
-
-    sciNewNumber = true;
-}
-
-void sciCalculate()
-{
-    double secondNumber = getSciNumber();
-
-    double result = 0;
-
-    switch (sciOperation)
-    {
-        case '+':
-            result = sciFirstNumber + secondNumber;
-            break;
-
-        case '-':
-            result = sciFirstNumber - secondNumber;
-            break;
-
-        case '*':
-            result = sciFirstNumber * secondNumber;
-            break;
-
-        case '/':
-            if (secondNumber == 0)
-            {
-                SetWindowTextA(
-                    sciDisplay,
-                    "Error"
-                );
-
-                sciNewNumber = true;
-                return;
-            }
-
-            result = sciFirstNumber / secondNumber;
-            break;
-
-        default:
-            return;
-    }
-
-    setSciNumber(result);
-
-    sciOperation = 0;
-    sciNewNumber = true;
-}
-
-
-// ---------------------------------------------------------
-// FACTORIAL
-// ---------------------------------------------------------
-
-double factorial(double n)
-{
-    if (n < 0 || floor(n) != n || n > 170)
-        return -1;
-
-    double result = 1;
-
-    for (int i = 1; i <= (int)n; i++)
-        result *= i;
-
-    return result;
-}
-
-
-// ---------------------------------------------------------
-// SCIENTIFIC FUNCTIONS
-// ---------------------------------------------------------
-
-void scientificFunction(int id)
-{
-    double x = getSciNumber();
-
-    double result = 0;
-
-    const double PI = 3.14159265358979323846;
-
-    if (id == S_SIN)
-    {
-        result = sin(x * PI / 180.0);
-    }
-
-    else if (id == S_COS)
-    {
-        result = cos(x * PI / 180.0);
-    }
-
-    else if (id == S_TAN)
-    {
-        double angle = x * PI / 180.0;
-
-        if (fabs(cos(angle)) < 1e-12)
-        {
-            SetWindowTextA(
-                sciDisplay,
-                "Error"
-            );
-
-            sciNewNumber = true;
-            return;
-        }
-
-        result = tan(angle);
-    }
-
-    else if (id == S_CSC)
-    {
-        double angle = x * PI / 180.0;
-
-        double s = sin(angle);
-
-        if (fabs(s) < 1e-12)
-        {
-            SetWindowTextA(
-                sciDisplay,
-                "Error"
-            );
-
-            sciNewNumber = true;
-            return;
-        }
-
-        result = 1.0 / s;
-    }
-
-    else if (id == S_SEC)
-    {
-        double angle = x * PI / 180.0;
-
-        double c = cos(angle);
-
-        if (fabs(c) < 1e-12)
-        {
-            SetWindowTextA(
-                sciDisplay,
-                "Error"
-            );
-
-            sciNewNumber = true;
-            return;
-        }
-
-        result = 1.0 / c;
-    }
-
-    else if (id == S_COT)
-    {
-        double angle = x * PI / 180.0;
-
-        double s = sin(angle);
-
-        if (fabs(s) < 1e-12)
-        {
-            SetWindowTextA(
-                sciDisplay,
-                "Error"
-            );
-
-            sciNewNumber = true;
-            return;
-        }
-
-        result = cos(angle) / s;
-    }
-
-    // LOG BASE 10
-    else if (id == S_LOG)
-    {
-        if (x <= 0)
-        {
-            SetWindowTextA(
-                sciDisplay,
-                "Error"
-            );
-
-            sciNewNumber = true;
-            return;
-        }
-
-        result = log10(x);
-    }
-
-    // LOG BASE e
-    else if (id == S_LN)
-    {
-        if (x <= 0)
-        {
-            SetWindowTextA(
-                sciDisplay,
-                "Error"
-            );
-
-            sciNewNumber = true;
-            return;
-        }
-
-        result = log(x);
-    }
-
-    // LOG BASE 2
-    else if (id == S_LOG2)
-    {
-        if (x <= 0)
-        {
-            SetWindowTextA(
-                sciDisplay,
-                "Error"
-            );
-
-            sciNewNumber = true;
-            return;
-        }
-
-        result = log2(x);
-    }
-
-    // SQUARE ROOT
-    else if (id == S_SQRT)
-    {
-        if (x < 0)
-        {
-            SetWindowTextA(
-                sciDisplay,
-                "Error"
-            );
-
-            sciNewNumber = true;
-            return;
-        }
-
-        result = sqrt(x);
-    }
-
-    // SQUARE
-    else if (id == S_SQUARE)
-    {
-        result = x * x;
-    }
-
-    // FACTORIAL
-    else if (id == S_FACTORIAL)
-    {
-        result = factorial(x);
-
-        if (result < 0)
-        {
-            SetWindowTextA(
-                sciDisplay,
-                "Error"
-            );
-
-            sciNewNumber = true;
-            return;
-        }
-    }
-
-    // PI
-    else if (id == S_PI)
-    {
-        result = 3.14159265358979323846;
-    }
-
-    // e
-    else if (id == S_E)
-    {
-        result = 2.71828182845904523536;
-    }
-
-    // ENTROPY
-    else if (id == S_ENTROPY)
-    {
-        /*
-            Binary Shannon Entropy:
-
-            H(p) =
-            -p log2(p)
-            -(1-p) log2(1-p)
-
-            Enter p between 0 and 1.
-            Example:
-            p = 0.5
-            H(0.5) = 1
-        */
-
-        if (x < 0 || x > 1)
-        {
-            SetWindowTextA(
-                sciDisplay,
-                "Enter p: 0 to 1"
-            );
-
-            sciNewNumber = true;
-            return;
-        }
-
-        if (x == 0 || x == 1)
-        {
-            result = 0;
-        }
-        else
-        {
-            result =
-                -x * log2(x)
-                -(1 - x) * log2(1 - x);
-        }
-    }
-
-    setSciNumber(result);
-
-    sciNewNumber = true;
-}
-
-
-// ---------------------------------------------------------
-// POWER x^y
-// ---------------------------------------------------------
-
-void startPower()
-{
-    sciFirstNumber = getSciNumber();
-
-    powerMode = true;
-
-    SetWindowTextA(
-        sciDisplay,
-        "0"
-    );
-
-    sciNewNumber = false;
-}
-
-void calculatePower()
-{
-    if (!powerMode)
-        return;
-
-    double exponent = getSciNumber();
-
-    double result = pow(
-        sciFirstNumber,
-        exponent
-    );
-
-    if (std::isnan(result) || std::isinf(result))
-    {
-        SetWindowTextA(
-            sciDisplay,
-            "Error"
-        );
-    }
-    else
-    {
-        setSciNumber(result);
-    }
-
-    powerMode = false;
-    sciNewNumber = true;
-}
-
-
-// ---------------------------------------------------------
-// CREATE BUTTON
-// ---------------------------------------------------------
-
-void createButton(
-    HWND parent,
-    const char* text,
-    int id,
-    int x,
-    int y,
-    int width,
-    int height)
-{
-    HWND button = CreateWindowA(
-        "BUTTON",
-        text,
-        WS_VISIBLE |
-        WS_CHILD |
-        BS_PUSHBUTTON,
-        x,
-        y,
-        width,
-        height,
-        parent,
-        (HMENU)(INT_PTR)id,
-        GetModuleHandle(NULL),
-        NULL
-    );
-
-    SendMessage(
-        button,
-        WM_SETFONT,
-        (WPARAM)normalFont,
-        TRUE
-    );
-}
-
-
-// ---------------------------------------------------------
-// MAIN WINDOW
-// ---------------------------------------------------------
-
-void createMainCalculator(HWND hwnd)
-{
-    int w = 75;
-    int h = 55;
-
-    // Row 1
-    createButton(hwnd, "7", M7, 25, 130, w, h);
-    createButton(hwnd, "8", M8, 110, 130, w, h);
-    createButton(hwnd, "9", M9, 195, 130, w, h);
-    createButton(hwnd, "/", M_DIV, 280, 130, w, h);
-
-    // Row 2
-    createButton(hwnd, "4", M4, 25, 195, w, h);
-    createButton(hwnd, "5", M5, 110, 195, w, h);
-    createButton(hwnd, "6", M6, 195, 195, w, h);
-    createButton(hwnd, "*", M_MUL, 280, 195, w, h);
-
-    // Row 3
-    createButton(hwnd, "1", M1, 25, 260, w, h);
-    createButton(hwnd, "2", M2, 110, 260, w, h);
-    createButton(hwnd, "3", M3, 195, 260, w, h);
-    createButton(hwnd, "-", M_SUB, 280, 260, w, h);
-
-    // Row 4
-    createButton(hwnd, "0", M0, 25, 325, w, h);
-    createButton(hwnd, ".", M_DOT, 110, 325, w, h);
-    createButton(hwnd, "%", M_PERCENT, 195, 325, w, h);
-    createButton(hwnd, "+", M_ADD, 280, 325, w, h);
-
-    // Row 5
-    createButton(
-        hwnd,
-        "CLEAR",
-        M_CLEAR,
-        25,
-        390,
-        160,
-        h
-    );
-
-    createButton(
-        hwnd,
-        "=",
-        M_EQUAL,
-        195,
-        390,
-        160,
-        h
-    );
-
-    // Scientific button
-    createButton(
-        hwnd,
-        "SCIENTIFIC",
-        M_SCI,
-        25,
-        465,
-        330,
-        60
-    );
-}
-
-
-// ---------------------------------------------------------
-// SCIENTIFIC WINDOW
-// ---------------------------------------------------------
-
-void createScientificCalculator(HWND hwnd)
-{
-    // Scientific display
-    sciDisplay = CreateWindowA(
-        "EDIT",
-        "0",
-        WS_VISIBLE |
-        WS_CHILD |
-        WS_BORDER |
-        ES_RIGHT |
-        ES_AUTOHSCROLL,
-        25,
-        25,
-        435,
-        65,
-        hwnd,
-        (HMENU)SCI_DISPLAY,
-        GetModuleHandle(NULL),
-        NULL
-    );
-
-    SendMessage(
-        sciDisplay,
-        WM_SETFONT,
-        (WPARAM)displayFont,
-        TRUE
-    );
-
-    int w = 75;
-    int h = 48;
-
-    // -------------------------------
-    // Scientific functions
-    // -------------------------------
-
-    createButton(hwnd, "sin", S_SIN, 25, 110, w, h);
-    createButton(hwnd, "cos", S_COS, 110, 110, w, h);
-    createButton(hwnd, "tan", S_TAN, 195, 110, w, h);
-    createButton(hwnd, "cosec", S_CSC, 280, 110, w, h);
-    createButton(hwnd, "sec", S_SEC, 365, 110, w, h);
-
-    createButton(hwnd, "cot", S_COT, 25, 165, w, h);
-    createButton(hwnd, "log", S_LOG, 110, 165, w, h);
-    createButton(hwnd, "ln", S_LN, 195, 165, w, h);
-    createButton(hwnd, "log2", S_LOG2, 280, 165, w, h);
-    createButton(hwnd, "sqrt", S_SQRT, 365, 165, w, h);
-
-    createButton(hwnd, "x^2", S_SQUARE, 25, 220, w, h);
-    createButton(hwnd, "x^y", S_POWER, 110, 220, w, h);
-    createButton(hwnd, "x!", S_FACTORIAL, 195, 220, w, h);
-    createButton(hwnd, "H(p)", S_ENTROPY, 280, 220, w, h);
-    createButton(hwnd, "pi", S_PI, 365, 220, w, h);
-
-    // -------------------------------
-    // Numbers
-    // -------------------------------
-
-    createButton(hwnd, "7", S7, 25, 290, w, h);
-    createButton(hwnd, "8", S8, 110, 290, w, h);
-    createButton(hwnd, "9", S9, 195, 290, w, h);
-    createButton(hwnd, "/", S_DIV, 280, 290, w, h);
-    createButton(hwnd, "e", S_E, 365, 290, w, h);
-
-    createButton(hwnd, "4", S4, 25, 345, w, h);
-    createButton(hwnd, "5", S5, 110, 345, w, h);
-    createButton(hwnd, "6", S6, 195, 345, w, h);
-    createButton(hwnd, "*", S_MUL, 280, 345, w, h);
-    createButton(hwnd, "C", S_CLEAR, 365, 345, w, h);
-
-    createButton(hwnd, "1", S1, 25, 400, w, h);
-    createButton(hwnd, "2", S2, 110, 400, w, h);
-    createButton(hwnd, "3", S3, 195, 400, w, h);
-    createButton(hwnd, "-", S_SUB, 280, 400, w, h);
-    createButton(hwnd, "BACK", S_BACK, 365, 400, w, h);
-
-    createButton(hwnd, "0", S0, 25, 455, w, h);
-    createButton(hwnd, ".", S_DOT, 110, 455, w, h);
-    createButton(hwnd, "+", S_ADD, 195, 455, w, h);
-
-    createButton(
-        hwnd,
-        "=",
-        S_EQUAL,
-        280,
-        455,
-        160,
-        h
-    );
-}
-
-
-// ---------------------------------------------------------
-// MAIN WINDOW PROCEDURE
-// ---------------------------------------------------------
-
-LRESULT CALLBACK MainWindowProc(
-    HWND hwnd,
-    UINT message,
-    WPARAM wParam,
-    LPARAM lParam)
-{
-    switch (message)
-    {
-        case WM_COMMAND:
-        {
-            int id = LOWORD(wParam);
-
-            if (id >= M0 && id <= M9)
-            {
-                char digit =
-                    '0' + (id - M0);
-
-                mainAddDigit(digit);
-            }
-
-            else if (id == M_DOT)
-            {
-                mainDecimal();
-            }
-
-            else if (id == M_ADD)
-            {
-                mainChooseOperation('+');
-            }
-
-            else if (id == M_SUB)
-            {
-                mainChooseOperation('-');
-            }
-
-            else if (id == M_MUL)
-            {
-                mainChooseOperation('*');
-            }
-
-            else if (id == M_DIV)
-            {
-                mainChooseOperation('/');
-            }
-
-            else if (id == M_EQUAL)
-            {
-                mainCalculate();
-            }
-
-            else if (id == M_CLEAR)
-            {
-                mainClear();
-            }
-
-            else if (id == M_PERCENT)
-            {
-                mainPercent();
-            }
-
-            else if (id == M_SCI)
-            {
-                // Open scientific calculator
-                if (!scientificWindow)
-                {
-                    scientificWindow = CreateWindowA(
-                        "ScientificWindow",
-                        "Calcii - Scientific Calculator",
-                        WS_OVERLAPPEDWINDOW,
-                        850,
-                        100,
-                        510,
-                        590,
-                        NULL,
-                        NULL,
-                        GetModuleHandle(NULL),
-                        NULL
-                    );
-
-                    createScientificCalculator(
-                        scientificWindow
-                    );
-                }
-
-                ShowWindow(
-                    scientificWindow,
-                    SW_SHOW
-                );
-
-                SetForegroundWindow(
-                    scientificWindow
-                );
-            }
-
-            return 0;
-        }
-
-        case WM_DESTROY:
-
-            PostQuitMessage(0);
-
-            return 0;
-    }
-
-    return DefWindowProcA(
-        hwnd,
-        message,
-        wParam,
-        lParam
-    );
-}
-
-
-// ---------------------------------------------------------
-// SCIENTIFIC WINDOW PROCEDURE
-// ---------------------------------------------------------
-
-LRESULT CALLBACK ScientificWindowProc(
-    HWND hwnd,
-    UINT message,
-    WPARAM wParam,
-    LPARAM lParam)
-{
-    switch (message)
-    {
-        case WM_COMMAND:
-        {
-            int id = LOWORD(wParam);
-
-            // Numbers
-            if (id >= S0 && id <= S9)
-            {
-                char digit =
-                    '0' + (id - S0);
-
-                sciAddDigit(digit);
-            }
-
-            // Decimal
-            else if (id == S_DOT)
-            {
-                sciDecimal();
-            }
-
-            // Basic operations
-            else if (id == S_ADD)
-            {
-                sciChooseOperation('+');
-            }
-
-            else if (id == S_SUB)
-            {
-                sciChooseOperation('-');
-            }
-
-            else if (id == S_MUL)
-            {
-                sciChooseOperation('*');
-            }
-
-            else if (id == S_DIV)
-            {
-                sciChooseOperation('/');
-            }
-
-            else if (id == S_EQUAL)
-            {
-                if (powerMode)
-                    calculatePower();
-                else
-                    sciCalculate();
-            }
-
-            // Clear
-            else if (id == S_CLEAR)
-            {
-                SetWindowTextA(
-                    sciDisplay,
-                    "0"
-                );
-
-                sciFirstNumber = 0;
-                sciOperation = 0;
-                sciNewNumber = true;
-                powerMode = false;
-            }
-
-            // Backspace
-            else if (id == S_BACK)
-            {
-                char buffer[200];
-
-                GetWindowTextA(
-                    sciDisplay,
-                    buffer,
-                    sizeof(buffer)
-                );
-
-                std::string text(buffer);
-
-                if (text.length() > 1)
-                {
-                    text.pop_back();
-
-                    SetWindowTextA(
-                        sciDisplay,
-                        text.c_str()
-                    );
-                }
-                else
-                {
-                    SetWindowTextA(
-                        sciDisplay,
-                        "0"
-                    );
-                }
-            }
-
-            // x^y
-            else if (id == S_POWER)
-            {
-                startPower();
-            }
-
-            // Scientific functions
-            else if (
-                id >= S_SIN &&
-                id <= S_E
-            )
-            {
-                scientificFunction(id);
-            }
-
-            return 0;
-        }
-
-        case WM_CLOSE:
-
-            ShowWindow(
-                hwnd,
-                SW_HIDE
-            );
-
-            return 0;
-    }
-
-    return DefWindowProcA(
-        hwnd,
-        message,
-        wParam,
-        lParam
-    );
-}
-
-
-// ---------------------------------------------------------
-// PROGRAM START
-// ---------------------------------------------------------
-
-int WINAPI WinMain(
-    HINSTANCE hInstance,
-    HINSTANCE,
-    LPSTR,
-    int nCmdShow)
-{
-    // Fonts
-    normalFont = CreateFontA(
-        18,
-        0,
-        0,
-        0,
-        FW_NORMAL,
-        FALSE,
-        FALSE,
-        FALSE,
-        ANSI_CHARSET,
-        OUT_DEFAULT_PRECIS,
-        CLIP_DEFAULT_PRECIS,
-        DEFAULT_QUALITY,
-        DEFAULT_PITCH,
-        "Segoe UI"
-    );
-
-    displayFont = CreateFontA(
-        30,
-        0,
-        0,
-        0,
-        FW_BOLD,
-        FALSE,
-        FALSE,
-        FALSE,
-        ANSI_CHARSET,
-        OUT_DEFAULT_PRECIS,
-        CLIP_DEFAULT_PRECIS,
-        DEFAULT_QUALITY,
-        DEFAULT_PITCH,
-        "Segoe UI"
-    );
-
-
-    // -----------------------------------------------------
-    // Main window class
-    // -----------------------------------------------------
-
-    WNDCLASSA mainClass = {};
-
-    mainClass.lpfnWndProc =
-        MainWindowProc;
-
-    mainClass.hInstance =
-        hInstance;
-
-    mainClass.lpszClassName =
-        "CalciiMainWindow";
-
-    mainClass.hbrBackground =
-        (HBRUSH)(COLOR_WINDOW + 1);
-
-    mainClass.hCursor =
-        LoadCursor(
-            NULL,
-            IDC_ARROW
-        );
-
-    RegisterClassA(&mainClass);
-
-
-    // -----------------------------------------------------
-    // Scientific window class
-    // -----------------------------------------------------
-
-    WNDCLASSA sciClass = {};
-
-    sciClass.lpfnWndProc =
-        ScientificWindowProc;
-
-    sciClass.hInstance =
-        hInstance;
-
-    sciClass.lpszClassName =
-        "ScientificWindow";
-
-    sciClass.hbrBackground =
-        (HBRUSH)(COLOR_WINDOW + 1);
-
-    sciClass.hCursor =
-        LoadCursor(
-            NULL,
-            IDC_ARROW
-        );
-
-    RegisterClassA(&sciClass);
-
-
-    // -----------------------------------------------------
-    // Create main calculator
-    // -----------------------------------------------------
-
-    mainWindow = CreateWindowA(
-        "CalciiMainWindow",
-        "Calcii - Akshat Yadav",
-        WS_OVERLAPPEDWINDOW,
-        350,
-        100,
-        410,
-        600,
-        NULL,
-        NULL,
-        hInstance,
-        NULL
-    );
-
-    if (!mainWindow)
+    case WM_CLOSE: DestroyWindow(h); return 0;
+    case WM_DESTROY:
+        hUnit = uTitle = uCat = uFrom = uTo = uVal = uRes = NULL;
         return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
 
+static void openUnit() {
+    if (hUnit) { ShowWindow(hUnit, SW_SHOW); SetForegroundWindow(hUnit); return; }
+    RECT r = { 0, 0, 380, 312 };
+    DWORD st = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    AdjustWindowRect(&r, st, FALSE);
+    RECT mr; GetWindowRect(hMain, &mr);
+    hUnit = CreateWindowW(L"CalcIIUnit", L"CALCII \u2014 UNIT CONVERTER", st,
+                          mr.left + ((mr.right - mr.left) - (r.right - r.left)) / 2,
+                          mr.top + ((mr.bottom - mr.top) - (r.bottom - r.top)) / 2,
+                          r.right - r.left, r.bottom - r.top,
+                          hMain, 0, hInst, 0);
+    ShowWindow(hUnit, SW_SHOW);
+    UpdateWindow(hUnit);
+}
 
-    // Main display
-    mainDisplay = CreateWindowA(
-        "EDIT",
-        "0",
-        WS_VISIBLE |
-        WS_CHILD |
-        WS_BORDER |
-        ES_RIGHT |
-        ES_AUTOHSCROLL,
-        25,
-        30,
-        330,
-        70,
-        mainWindow,
-        (HMENU)MAIN_DISPLAY,
-        hInstance,
-        NULL
-    );
+// ====================================================================
+//                             MAIN WINDOW
+// ====================================================================
+static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_CREATE: {
+        hMain = h;
+        hTitle = CreateWindowW(L"STATIC", L"CALCII \u2014 DHRUV PRATAP", WS_CHILD | WS_VISIBLE | SS_CENTER,
+                               10, 8, 740, 26, h, 0, hInst, 0);
+        SendMessageW(hTitle, WM_SETFONT, (WPARAM)g_titleFont, TRUE);
 
-    SendMessage(
-        mainDisplay,
-        WM_SETFONT,
-        (WPARAM)displayFont,
-        TRUE
-    );
+        hIn = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                              WS_CHILD | WS_VISIBLE | ES_RIGHT | ES_AUTOHSCROLL | ES_NOHIDESEL,
+                              14, 38, 732, 40, h, (HMENU)(INT_PTR)100, hInst, 0);
+        SendMessageW(hIn, WM_SETFONT, (WPARAM)g_dispFont, TRUE);
+        oldEditProc = (WNDPROC)SetWindowLongPtrW(hIn, GWLP_WNDPROC, (LONG_PTR)EditProc);
 
+        hOut = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                               WS_CHILD | WS_VISIBLE | ES_RIGHT | ES_AUTOHSCROLL | ES_READONLY,
+                               14, 82, 732, 36, h, (HMENU)(INT_PTR)101, hInst, 0);
+        SendMessageW(hOut, WM_SETFONT, (WPARAM)g_dispFont, TRUE);
 
-    createMainCalculator(
-        mainWindow
-    );
+        hModeLbl = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE, 16, 124, 728, 18, h, 0, hInst, 0);
+        SendMessageW(hModeLbl, WM_SETFONT, (WPARAM)g_smallFont, TRUE);
 
+        MkBtn(h, L"SCI",  ID_SCI,  14,  150, 236, 34);
+        MkBtn(h, L"INFO", ID_INFO, 262, 150, 236, 34);
+        MkBtn(h, L"UNIT", ID_UNIT, 510, 150, 236, 34);
 
-    ShowWindow(
-        mainWindow,
-        nCmdShow
-    );
+        MkLabel(h, L"SCIENTIFIC / INFORMATION TOOLS", 14, 194, 340, 20);
+        MkLabel(h, L"KEYPAD", 390, 194, 330, 20);
+        for (int i = 0; i < 16; i++)
+            hExtra[i] = MkBtn(h, L"", ID_EXTRA + i, 14 + (i % 4) * 82, 220 + (i / 4) * 39, 76, 34);
+        for (int i = 0; i < 20; i++)
+            MkBtn(h, KEYS[i].label, ID_KEY + i, 390 + (i % 4) * 84, 220 + (i / 4) * 39, 78, 34);
+        MkBtn(h, L"=", ID_EQ, 390, 420, 330, 38);
 
-    UpdateWindow(
-        mainWindow
-    );
+        setMode(0);
+        EnumChildWindows(h, collectMainChild, 0);
+        RECT client;
+        GetClientRect(h, &client);
+        layoutMain(client.right, client.bottom);
+        SetFocus(hIn);
+        return 0;
+    }
+    case WM_SIZE:
+        layoutMain(LOWORD(l), HIWORD(l));
+        return 0;
+    case WM_COMMAND: {
+        int id = LOWORD(w);
+        if (id == ID_SCI) setMode(0);
+        else if (id == ID_INFO) setMode(1);
+        else if (id == ID_UNIT) openUnit();
+        else if (id >= ID_EXTRA && id < ID_EXTRA + 16) doExtra(id - ID_EXTRA);
+        else if (id >= ID_KEY && id < ID_KEY + 20) doKey(id - ID_KEY);
+        else if (id == ID_EQ) doEquals();
+        if (id >= 900) SetFocus(hIn);
+        return 0;
+    }
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT* d = (DRAWITEMSTRUCT*)l;
+        bool active = (d->CtlID == ID_SCI && g_mode == 0) || (d->CtlID == ID_INFO && g_mode == 1);
+        DrawBtn(d, active);
+        return TRUE;
+    }
+    case WM_CTLCOLOREDIT: {
+        HDC dc = (HDC)w; SetTextColor(dc, RGB(30, 48, 70)); SetBkColor(dc, RGB(255, 255, 255));
+        return (LRESULT)hWhite;
+    }
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = (HDC)w; HWND c = (HWND)l;
+        if (c == hOut) { SetTextColor(dc, RGB(30, 48, 70)); SetBkColor(dc, RGB(255, 255, 255)); return (LRESULT)hWhite; }
+        SetBkColor(dc, RGB(243, 246, 250));
+        SetTextColor(dc, c == hTitle ? RGB(39, 83, 143) : RGB(63, 79, 99));
+        return (LRESULT)hSurface;
+    }
+    case WM_DESTROY: PostQuitMessage(0); return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
 
+int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int) {
+    hInst = hi;
+    hSurface = CreateSolidBrush(RGB(243, 246, 250));
+    hWhite = CreateSolidBrush(RGB(255, 255, 255));
+    g_btnFont   = CreateFontW(-17, 0, 0, 0, FW_BOLD,   0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    g_dispFont  = CreateFontW(-26, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Consolas");
+    g_titleFont = CreateFontW(-20, 0, 0, 0, FW_BOLD,   0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    g_smallFont = CreateFontW(-15, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
 
-    // -----------------------------------------------------
-    // Message loop
-    // -----------------------------------------------------
+    WNDCLASSW wc = {};
+    wc.hInstance = hi; wc.hCursor = LoadCursor(NULL, IDC_ARROW); wc.hbrBackground = hSurface;
+    wc.lpfnWndProc = MainProc;  wc.lpszClassName = L"CalcIIMain";
+    RegisterClassW(&wc);
+    wc.lpfnWndProc = UnitProc;  wc.lpszClassName = L"CalcIIUnit";
+    RegisterClassW(&wc);
 
-    MSG msg = {};
+    RECT r = { 0, 0, 760, 470 };
+    DWORD st = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX |
+               WS_THICKFRAME | WS_MAXIMIZEBOX;
+    AdjustWindowRect(&r, st, FALSE);
+    HWND w = CreateWindowW(L"CalcIIMain", L"CALCII \u2014 DHRUV PRATAP", st,
+                           CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
+                           0, 0, hi, 0);
+    ShowWindow(w, SW_SHOWMAXIMIZED);
+    UpdateWindow(w);
 
-    while (
-        GetMessage(
-            &msg,
-            NULL,
-            0,
-            0
-        )
-    )
-    {
+    MSG msg;
+    while (GetMessageW(&msg, 0, 0, 0) > 0) {
         TranslateMessage(&msg);
-
-        DispatchMessage(&msg);
+        DispatchMessageW(&msg);
     }
-
-
-    return 0;
+    return (int)msg.wParam;
 }
